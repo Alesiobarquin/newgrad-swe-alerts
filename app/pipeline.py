@@ -1,0 +1,108 @@
+"""One poll tick: ingest → claim → classify → escalate."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+import httpx
+
+from app.classifier import ClassificationError, GeminiClassifier
+from app.config import Settings
+from app.escalation import Escalator, PushoverError
+from app.media import MediaError, prepare_frame
+from app.models import FailedClassificationItem, StoryAsset
+from app.scrapers.base import ScraperError, StoryScraper
+from app.state import RedisState
+
+if TYPE_CHECKING:
+    from apscheduler.schedulers.blocking import BlockingScheduler
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AppContext:
+    settings: Settings
+    http: httpx.Client
+    state: RedisState
+    scraper: StoryScraper
+    classifier: GeminiClassifier
+    escalator: Escalator
+    scheduler: BlockingScheduler | None = None
+
+
+def run_poll_tick(ctx: AppContext, *, now: datetime | None = None) -> None:
+    now = now or datetime.now(ctx.settings.tz)
+    if not ctx.state.acquire_job_lock("poller", ttl_seconds=ctx.settings.poller_lock_ttl_seconds):
+        logger.warning("poll tick skipped; lock held")
+        return
+    try:
+        stories = ctx.scraper.fetch_stories(ctx.settings.target_ig_username)
+        logger.info("fetched %s stories for @%s", len(stories), ctx.settings.target_ig_username)
+        for story in stories:
+            process_story(ctx, story, now=now)
+    except ScraperError:
+        logger.exception("ingest failed; tick aborted without claiming stories")
+    except Exception:
+        logger.exception("poll tick failed")
+    finally:
+        ctx.state.release_job_lock("poller")
+
+
+def process_story(ctx: AppContext, story: StoryAsset, *, now: datetime) -> None:
+    if not ctx.state.try_claim(story.story_id):
+        logger.debug("skip story %s (seen or in-flight)", story.story_id)
+        return
+
+    try:
+        frame_bytes, mime_type = prepare_frame(ctx.http, story)
+    except MediaError:
+        logger.exception("media failed for %s; releasing claim for retry", story.story_id)
+        ctx.state.release_claim(story.story_id)
+        return
+
+    try:
+        classification = ctx.classifier.classify(story, frame_bytes, mime_type)
+    except ClassificationError as exc:
+        logger.exception("classification failed for %s; leaving claiming TTL as cooldown", story.story_id)
+        ctx.state.push_dlq(
+            FailedClassificationItem(
+                story_id=story.story_id,
+                error=str(exc),
+                failed_at=datetime.now(timezone.utc),
+                image_url=story.image_url,
+                video_url=story.video_url,
+                link_urls=story.link_urls,
+            )
+        )
+        ctx.escalator.send_debug(story.story_id, str(exc))
+        return
+
+    if not classification.is_new_grad_swe:
+        ctx.state.mark_seen_and_release(story.story_id)
+        logger.info("story %s classified negative", story.story_id)
+        return
+
+    try:
+        ctx.escalator.dispatch_positive(
+            story_id=story.story_id,
+            taken_at=story.taken_at,
+            classification=classification,
+            now=now,
+        )
+    except PushoverError as exc:
+        if exc.sent_uncertain:
+            logger.exception("Pushover uncertain success for %s; marking seen to avoid duplicate sirens", story.story_id)
+            ctx.state.mark_seen_and_release(story.story_id)
+            return
+        logger.exception("Pushover failed for %s; leaving claiming TTL for retry", story.story_id)
+        return
+
+    ctx.state.mark_seen_and_release(story.story_id)
+
+
+def run_morning_burst(ctx: AppContext) -> None:
+    ctx.escalator.run_morning_burst()
