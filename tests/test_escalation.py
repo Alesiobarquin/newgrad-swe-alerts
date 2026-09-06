@@ -145,3 +145,33 @@ def test_morning_burst_one_siren_then_p1_overflow(state) -> None:
     for call in calls:
         assert len(call.kwargs["data"]["message"]) <= PUSHOVER_MESSAGE_MAX
     assert state.drain_quiet() == []
+
+
+def test_ntfy_emergency_uses_priority_5(state) -> None:
+    settings = make_settings(
+        notify_provider="ntfy",
+        ntfy_topic="swe-alerts-test",
+        ntfy_base_url="https://ntfy.sh",
+        pushover_app_token="",
+        pushover_user_key="",
+    )
+    http = MagicMock()
+    http.post.return_value = MagicMock(status_code=200, json=lambda: {"id": "abc"})
+    http.post.return_value.raise_for_status = MagicMock()
+    escalator = Escalator(settings, http, state)
+    now = datetime(2026, 8, 26, 15, 0, tzinfo=TZ)
+    escalator.dispatch_positive(
+        story_id="s1",
+        taken_at=None,
+        classification=_cls(company="BoutiqueCo"),
+        now=now,
+    )
+    args, kwargs = http.post.call_args
+    assert args[0] == "https://ntfy.sh"
+    body = kwargs["json"]
+    assert body["topic"] == "swe-alerts-test"
+    assert body["priority"] == 5
+    assert body["title"].startswith("NEW GRAD SWE")
+    assert "—" in body["title"]
+    assert body["click"] == "https://jobs.example/1"
+

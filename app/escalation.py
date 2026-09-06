@@ -1,16 +1,16 @@
-"""Quiet-hours routing, deterministic override, and Pushover dispatch."""
+"""Quiet-hours routing, deterministic override, and pluggable push dispatch."""
 
 from __future__ import annotations
 
 import logging
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from app.config import Settings
-from app.http import PUSHOVER_TIMEOUT
+from app.http import NOTIFY_TIMEOUT
 from app.models import Classification, QuietQueueItem
 from app.state import RedisState
 
@@ -22,11 +22,23 @@ PUSHOVER_TITLE_MAX = 250
 P2_RETRY_SECONDS = 30
 P2_EXPIRE_SECONDS = 3600
 
+NTFY_PRIORITY_EMERGENCY = "5"
+NTFY_PRIORITY_LOW = "1"
 
-class PushoverError(Exception):
+
+class NotifyError(Exception):
     def __init__(self, message: str, *, sent_uncertain: bool = False) -> None:
         super().__init__(message)
         self.sent_uncertain = sent_uncertain
+
+
+PushoverError = NotifyError
+
+
+class NotificationBackend(Protocol):
+    def send_emergency(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]: ...
+
+    def send_priority_low(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]: ...
 
 
 def in_quiet_hours(now: datetime, settings: Settings) -> bool:
@@ -71,11 +83,103 @@ def truncate_message(text: str, limit: int = PUSHOVER_MESSAGE_MAX) -> str:
     return text[: limit - 1] + "…"
 
 
+def build_notifier(settings: Settings, http: httpx.Client) -> NotificationBackend:
+    if settings.notify_provider == "pushover":
+        return PushoverBackend(settings, http)
+    return NtfyBackend(settings, http)
+
+
+class NtfyBackend:
+    def __init__(self, settings: Settings, http: httpx.Client) -> None:
+        self._settings = settings
+        self._http = http
+
+    def send_emergency(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
+        return self._publish(title=title, message=message, url=url, priority=NTFY_PRIORITY_EMERGENCY, tags="rotating_light,siren")
+
+    def send_priority_low(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
+        return self._publish(title=title, message=message, url=url, priority=NTFY_PRIORITY_LOW, tags="mute")
+
+    def _publish(
+        self,
+        *,
+        title: str,
+        message: str,
+        url: str | None,
+        priority: str,
+        tags: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "topic": self._settings.ntfy_topic.strip(),
+            "title": truncate_message(title, PUSHOVER_TITLE_MAX),
+            "message": truncate_message(message, PUSHOVER_MESSAGE_MAX),
+            "priority": int(priority),
+            "tags": [tag.strip() for tag in tags.split(",") if tag.strip()],
+        }
+        if url:
+            payload["click"] = url[:512]
+        headers: dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
+        if self._settings.ntfy_token.strip():
+            headers["Authorization"] = f"Bearer {self._settings.ntfy_token.strip()}"
+        return _post_notify(
+            self._http,
+            self._settings.ntfy_base_url.rstrip("/"),
+            headers=headers,
+            json_body=payload,
+            provider="ntfy",
+        )
+
+
+class PushoverBackend:
+    def __init__(self, settings: Settings, http: httpx.Client) -> None:
+        self._settings = settings
+        self._http = http
+
+    def send_emergency(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
+        extra: dict[str, Any] = {"retry": P2_RETRY_SECONDS, "expire": P2_EXPIRE_SECONDS, "sound": "siren"}
+        return self._publish(title=title, message=message, url=url, priority=2, extra=extra)
+
+    def send_priority_low(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
+        return self._publish(title=title, message=message, url=url, priority=-1, extra={"sound": "none"})
+
+    def _publish(
+        self,
+        *,
+        title: str,
+        message: str,
+        url: str | None,
+        priority: int,
+        extra: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "token": self._settings.pushover_app_token,
+            "user": self._settings.pushover_user_key,
+            "title": truncate_message(title, PUSHOVER_TITLE_MAX),
+            "message": truncate_message(message, PUSHOVER_MESSAGE_MAX),
+            "priority": priority,
+            **extra,
+        }
+        if url:
+            payload["url"] = url[:512]
+            payload["url_title"] = "Open listing"
+        body = _post_notify(self._http, PUSHOVER_ENDPOINT, data=payload, provider="pushover")
+        if body.get("status") != 1:
+            raise NotifyError(f"Pushover rejected payload: {body}", sent_uncertain=False)
+        return body
+
+
 class Escalator:
-    def __init__(self, settings: Settings, http: httpx.Client, state: RedisState) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        http: httpx.Client,
+        state: RedisState,
+        notifier: NotificationBackend | None = None,
+    ) -> None:
         self._settings = settings
         self._http = http
         self._state = state
+        self._notifier = notifier or build_notifier(settings, http)
 
     def dispatch_positive(self, *, story_id: str, taken_at: datetime | None, classification: Classification, now: datetime) -> None:
         override = is_override(classification, self._settings)
@@ -111,13 +215,17 @@ class Escalator:
             primary, overflow = pack_morning_burst(items)
             try:
                 self.send_emergency(title="Overnight New Grad SWE Drops", message=primary)
-            except PushoverError:
+            except NotifyError:
                 self._state.restore_quiet(items)
                 raise
             for extra in overflow:
                 line = _format_overflow_line(extra)
                 self.send_priority_low(title="Overnight drop (overflow)", message=line)
-            logger.info("morning burst sent: %s in P2, %s overflow P-1", _count_primary(items, overflow), len(overflow))
+            logger.info(
+                "morning burst sent: %s emergency, %s overflow low-priority",
+                _count_primary(items, overflow),
+                len(overflow),
+            )
         finally:
             self._state.release_job_lock("morning_burst")
 
@@ -127,78 +235,14 @@ class Escalator:
                 title="[Debug] classification failed",
                 message=truncate_message(f"story {story_id}: {error}"),
             )
-        except PushoverError:
+        except NotifyError:
             logger.exception("failed to send classification debug ping for %s", story_id)
 
     def send_emergency(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
-        return self._send(
-            title=title,
-            message=message,
-            url=url,
-            priority=2,
-            retry=P2_RETRY_SECONDS,
-            expire=P2_EXPIRE_SECONDS,
-            sound="siren",
-        )
+        return self._notifier.send_emergency(title=title, message=message, url=url)
 
     def send_priority_low(self, *, title: str, message: str, url: str | None = None) -> dict[str, Any]:
-        return self._send(
-            title=title,
-            message=message,
-            url=url,
-            priority=-1,
-            sound="none",
-        )
-
-    def _send(
-        self,
-        *,
-        title: str,
-        message: str,
-        url: str | None,
-        priority: int,
-        sound: str,
-        retry: int | None = None,
-        expire: int | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "token": self._settings.pushover_app_token,
-            "user": self._settings.pushover_user_key,
-            "title": truncate_message(title, PUSHOVER_TITLE_MAX),
-            "message": truncate_message(message, PUSHOVER_MESSAGE_MAX),
-            "priority": priority,
-            "sound": sound,
-        }
-        if url:
-            payload["url"] = url[:512]
-            payload["url_title"] = "Open listing"
-        if retry is not None:
-            payload["retry"] = retry
-        if expire is not None:
-            payload["expire"] = expire
-
-        sent_uncertain = False
-        try:
-            response = self._http.post(PUSHOVER_ENDPOINT, data=payload, timeout=PUSHOVER_TIMEOUT)
-            sent_uncertain = True
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise PushoverError("Pushover timed out", sent_uncertain=sent_uncertain) from exc
-        except httpx.HTTPStatusError as exc:
-            raise PushoverError(
-                f"Pushover HTTP {exc.response.status_code}: {exc.response.text[:200]}",
-                sent_uncertain=False,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise PushoverError(f"Pushover transport error: {exc}", sent_uncertain=sent_uncertain) from exc
-
-        try:
-            body = response.json()
-        except ValueError:
-            body = {"status": 1}
-        if body.get("status") != 1:
-            raise PushoverError(f"Pushover rejected payload: {body}", sent_uncertain=False)
-        return body
+        return self._notifier.send_priority_low(title=title, message=message, url=url)
 
 
 def pack_morning_burst(items: list[QuietQueueItem]) -> tuple[str, list[QuietQueueItem]]:
@@ -246,3 +290,46 @@ def _format_overflow_line(item: QuietQueueItem) -> str:
 
 def _count_primary(items: list[QuietQueueItem], overflow: list[QuietQueueItem]) -> int:
     return max(0, len(items) - len(overflow))
+
+
+def _post_notify(
+    http: httpx.Client,
+    endpoint: str,
+    *,
+    provider: str,
+    headers: dict[str, str] | None = None,
+    content: str | None = None,
+    data: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sent_uncertain = False
+    try:
+        kwargs: dict[str, Any] = {"timeout": NOTIFY_TIMEOUT}
+        if headers is not None:
+            kwargs["headers"] = headers
+        if json_body is not None:
+            kwargs["json"] = json_body
+        if content is not None:
+            kwargs["content"] = content
+        if data is not None:
+            kwargs["data"] = data
+        response = http.post(endpoint, **kwargs)
+        sent_uncertain = True
+        response.raise_for_status()
+    except UnicodeEncodeError as exc:
+        raise NotifyError(f"{provider} rejected non-ASCII headers: {exc}", sent_uncertain=False) from exc
+    except httpx.TimeoutException as exc:
+        raise NotifyError(f"{provider} timed out", sent_uncertain=sent_uncertain) from exc
+    except httpx.HTTPStatusError as exc:
+        raise NotifyError(
+            f"{provider} HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            sent_uncertain=False,
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise NotifyError(f"{provider} transport error: {exc}", sent_uncertain=sent_uncertain) from exc
+
+    try:
+        body = response.json()
+        return body if isinstance(body, dict) else {"status": 1, "raw": body}
+    except ValueError:
+        return {"status": 1}

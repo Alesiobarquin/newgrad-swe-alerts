@@ -7,6 +7,7 @@ import httpx
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 MEDIA_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 PUSHOVER_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+NOTIFY_TIMEOUT = PUSHOVER_TIMEOUT
 
 
 def build_http_client() -> httpx.Client:

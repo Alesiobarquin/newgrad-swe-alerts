@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ _DEFAULT_OVERRIDE_COMPANIES = (
 )
 
 ScraperProvider = Literal["rapidapi", "apify_standby"]
+NotifyProvider = Literal["ntfy", "pushover"]
 HttpMethod = Literal["GET", "POST"]
 
 
@@ -26,6 +28,7 @@ class Settings(BaseSettings):
 
     scraper_provider: ScraperProvider = "rapidapi"
     target_ig_username: str = "zero2sudo"
+    target_ig_user_id: str = ""
 
     rapidapi_key: str = ""
     rapidapi_host: str = ""
@@ -33,6 +36,7 @@ class Settings(BaseSettings):
     rapidapi_url_template: str = "https://{host}/user/stories?username={username}"
     rapidapi_body_template: str = ""
     rapidapi_items_path: str = "data.stories"
+    rapidapi_user_id_url_template: str = "https://{host}/user_id_by_username?username={username}"
 
     apify_api_token: str = ""
     apify_standby_url: str = ""
@@ -40,9 +44,14 @@ class Settings(BaseSettings):
 
     upstash_redis_url: str = Field(min_length=1)
     gemini_api_key: str = Field(min_length=1)
-    gemini_model: str = "gemini-1.5-flash"
-    pushover_app_token: str = Field(min_length=1)
-    pushover_user_key: str = Field(min_length=1)
+    gemini_model: str = "gemini-3.6-flash"
+
+    notify_provider: NotifyProvider = "ntfy"
+    ntfy_base_url: str = "https://ntfy.sh"
+    ntfy_topic: str = ""
+    ntfy_token: str = ""
+    pushover_app_token: str = ""
+    pushover_user_key: str = ""
 
     override_companies: str = _DEFAULT_OVERRIDE_COMPANIES
     quiet_hours_start_hour: int = Field(default=23, ge=0, le=23)
@@ -70,6 +79,28 @@ class Settings(BaseSettings):
             return value.strip().upper()
         return value
 
+    @field_validator("notify_provider", mode="before")
+    @classmethod
+    def _lower_notify_provider(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+    @field_validator("upstash_redis_url", mode="before")
+    @classmethod
+    def _normalize_redis_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        raw = value.strip().strip("'\"")
+        match = re.search(r"(rediss?://[^\s'\"]+)", raw)
+        if not match:
+            return raw
+        url = match.group(1).rstrip("\"'")
+        if url.startswith("redis://") and not url.startswith("rediss://"):
+            if "upstash.io" in url.lower() or "redis-cli" in raw or "--tls" in raw:
+                url = "rediss://" + url[len("redis://") :]
+        return url
+
     @field_validator("target_ig_username", mode="before")
     @classmethod
     def _strip_at(cls, value: object) -> object:
@@ -87,6 +118,12 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "APIFY_API_TOKEN and APIFY_STANDBY_URL are required when SCRAPER_PROVIDER=apify_standby"
                 )
+        if self.notify_provider == "ntfy":
+            if not self.ntfy_topic.strip():
+                raise ValueError("NTFY_TOPIC is required when NOTIFY_PROVIDER=ntfy")
+        elif self.notify_provider == "pushover":
+            if not self.pushover_app_token or not self.pushover_user_key:
+                raise ValueError("PUSHOVER_APP_TOKEN and PUSHOVER_USER_KEY are required when NOTIFY_PROVIDER=pushover")
         return self
 
     @property
@@ -103,4 +140,5 @@ class Settings(BaseSettings):
 
     @property
     def poller_lock_ttl_seconds(self) -> int:
-        return max(120, self.active_poll_interval_seconds * 3)
+        # Cap so a 2h smoke-test interval cannot pin the lock for 6h after a crash.
+        return max(120, min(self.active_poll_interval_seconds * 3, 900))

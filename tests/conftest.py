@@ -18,6 +18,7 @@ def make_settings(**overrides: object) -> Settings:
         "gemini_api_key": "test-gemini-key",
         "pushover_app_token": "test-pushover-app",
         "pushover_user_key": "test-pushover-user",
+        "notify_provider": "pushover",
         "target_ig_username": "zero2sudo",
     }
     payload.update(overrides)

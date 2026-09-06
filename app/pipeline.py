@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from app.classifier import ClassificationError, GeminiClassifier
+from app.classifier import ClassificationError, ClassifierConfigError, GeminiClassifier
 from app.config import Settings
 from app.escalation import Escalator, PushoverError
 from app.media import MediaError, prepare_frame
@@ -34,20 +34,26 @@ class AppContext:
     scheduler: BlockingScheduler | None = None
 
 
-def run_poll_tick(ctx: AppContext, *, now: datetime | None = None) -> None:
+def run_poll_tick(ctx: AppContext, *, now: datetime | None = None) -> int:
     now = now or datetime.now(ctx.settings.tz)
     if not ctx.state.acquire_job_lock("poller", ttl_seconds=ctx.settings.poller_lock_ttl_seconds):
         logger.warning("poll tick skipped; lock held")
-        return
+        return 0
     try:
         stories = ctx.scraper.fetch_stories(ctx.settings.target_ig_username)
         logger.info("fetched %s stories for @%s", len(stories), ctx.settings.target_ig_username)
         for story in stories:
             process_story(ctx, story, now=now)
+        return len(stories)
     except ScraperError:
         logger.exception("ingest failed; tick aborted without claiming stories")
+        return -1
+    except ClassifierConfigError as exc:
+        logger.error("%s", exc)
+        return -1
     except Exception:
         logger.exception("poll tick failed")
+        return -1
     finally:
         ctx.state.release_job_lock("poller")
 
@@ -67,7 +73,13 @@ def process_story(ctx: AppContext, story: StoryAsset, *, now: datetime) -> None:
     try:
         classification = ctx.classifier.classify(story, frame_bytes, mime_type)
     except ClassificationError as exc:
-        logger.exception("classification failed for %s; leaving claiming TTL as cooldown", story.story_id)
+        logger.error("classification failed for %s: %s", story.story_id, exc)
+        if "NOT_FOUND" in str(exc) or "not found" in str(exc).lower():
+            ctx.state.release_claim(story.story_id)
+            raise ClassifierConfigError(
+                "Gemini model is unavailable. Set GEMINI_MODEL to a current Flash model "
+                "(e.g. gemini-3.6-flash) and rerun. Claim released so stories can retry."
+            ) from exc
         ctx.state.push_dlq(
             FailedClassificationItem(
                 story_id=story.story_id,

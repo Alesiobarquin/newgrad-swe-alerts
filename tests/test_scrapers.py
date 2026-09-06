@@ -114,3 +114,29 @@ def test_rapidapi_transport_error_exhausted(monkeypatch) -> None:
     monkeypatch.setattr("app.scrapers.rapidapi.time.sleep", lambda _s: None)
     with pytest.raises(ScraperError):
         RapidApiScraper(settings, client).fetch_stories("zero2sudo")
+
+
+def test_rapidapi_resolves_user_id_then_fetches_stories(monkeypatch) -> None:
+    settings = make_settings(
+        rapidapi_url_template="https://{host}/stories?user_id={user_id}",
+        rapidapi_items_path="",
+        rapidapi_user_id_url_template="https://{host}/user_id_by_username?username={username}",
+    )
+    client = MagicMock()
+    client.request.side_effect = [
+        _Resp(200, {"UserID": 111222333}),
+        _Resp(200, [{"id": "story-9", "displayUrl": "https://cdn.example/z.jpg"}]),
+        _Resp(200, [{"id": "story-9", "displayUrl": "https://cdn.example/z.jpg"}]),
+    ]
+    monkeypatch.setattr("app.scrapers.rapidapi.time.sleep", lambda _s: None)
+    scraper = RapidApiScraper(settings, client)
+    stories = scraper.fetch_stories("zero2sudo")
+    assert stories[0].story_id == "story-9"
+    first_url = client.request.call_args_list[0].args[1]
+    second_url = client.request.call_args_list[1].args[1]
+    assert "user_id_by_username" in first_url
+    assert "username=zero2sudo" in first_url
+    assert "user_id=111222333" in second_url
+    scraper.fetch_stories("zero2sudo")
+    assert client.request.call_count == 3
+

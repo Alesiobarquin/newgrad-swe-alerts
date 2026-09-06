@@ -45,12 +45,32 @@ def test_empty_secrets_are_rejected() -> None:
     with pytest.raises(ValidationError):
         make_settings(gemini_api_key="")
     with pytest.raises(ValidationError):
-        make_settings(pushover_user_key="")
+        make_settings(notify_provider="pushover", pushover_user_key="")
+    with pytest.raises(ValidationError):
+        make_settings(notify_provider="ntfy", ntfy_topic="")
 
 
-def test_poller_lock_ttl_scales_with_interval() -> None:
+def test_ntfy_provider_does_not_need_pushover() -> None:
+    settings = make_settings(
+        notify_provider="ntfy",
+        ntfy_topic="alesio-swe-test",
+        pushover_app_token="",
+        pushover_user_key="",
+    )
+    assert settings.notify_provider == "ntfy"
+
+
+def test_redis_cli_snippet_is_normalized_to_rediss() -> None:
+    settings = make_settings(
+        upstash_redis_url="redis-cli --tls -u redis://default:secret@ready-fun-12345.upstash.io:6379"
+    )
+    assert settings.upstash_redis_url.startswith("rediss://")
+    assert "upstash.io" in settings.upstash_redis_url
+    assert "redis-cli" not in settings.upstash_redis_url
     settings = make_settings(active_poll_interval_seconds=60)
     assert settings.poller_lock_ttl_seconds == 180
+    settings = make_settings(active_poll_interval_seconds=7200)
+    assert settings.poller_lock_ttl_seconds == 900
 
 
 def test_dotenv_comma_companies_roundtrip(tmp_path) -> None:
@@ -63,6 +83,7 @@ def test_dotenv_comma_companies_roundtrip(tmp_path) -> None:
                 "RAPIDAPI_HOST=example.p.rapidapi.com",
                 "UPSTASH_REDIS_URL=rediss://default:fake@localhost:6379",
                 "GEMINI_API_KEY=g",
+                "NOTIFY_PROVIDER=pushover",
                 "PUSHOVER_APP_TOKEN=p",
                 "PUSHOVER_USER_KEY=u",
                 "OVERRIDE_COMPANIES=Google,Stripe,Jane Street",

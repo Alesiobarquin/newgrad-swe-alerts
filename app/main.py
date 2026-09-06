@@ -88,7 +88,7 @@ def register_jobs(scheduler: BaseScheduler, ctx: AppContext) -> int:
         id=POLL_JOB_ID,
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=30,
+        misfire_grace_time=max(30, initial),
         replace_existing=True,
     )
     scheduler.add_job(

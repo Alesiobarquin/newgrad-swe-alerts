@@ -40,6 +40,10 @@ class ClassificationError(Exception):
     """Raised when Gemini cannot produce a valid Classification after retries."""
 
 
+class ClassifierConfigError(ClassificationError):
+    """Raised when the configured Gemini model is unavailable."""
+
+
 class GeminiClassifier:
     def __init__(self, settings: Settings, client: Any | None = None) -> None:
         self._settings = settings
