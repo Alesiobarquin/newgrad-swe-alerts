@@ -1,12 +1,44 @@
 # New Grad SWE Alert Engine
 
-A production-grade, low-latency alerting service that monitors Instagram story job drops (targeting [@zero2sudo](https://www.instagram.com/zero2sudo/)), classifies story media with **Google Gemini Multimodal Vision**, and dispatches high-priority mobile push notifications (**ntfy** or **Pushover**) before application windows close. The production worker runs continuously on an Azure VM and does not depend on a developer computer remaining online.
+A production-grade alerting system that turns time-sensitive Instagram job-drop stories into reliable, intelligent mobile notifications.
 
-## Production Status
+`Python` · `APScheduler` · `Redis` · `Gemini` · `ffmpeg` · `Docker` · `Azure` · `Terraform`
 
-The current deployment was provisioned and verified on September 11, 2026:
+## Why I Built This
 
-- Azure for Students `Standard_B2ats_v2` Ubuntu VM in Mexico Central. The subscription's enforced region policy does not permit the originally considered East US or North Central US regions.
+[@zero2sudo](https://www.instagram.com/zero2sudo/) is often one of the first places I see competitive new-grad software engineering openings announced. For roles that attract thousands of applicants, finding the posting early can be the difference between applying near the front of the queue and discovering it after the opportunity has already spread everywhere else.
+
+The problem was that Instagram notifications were too inconsistent for something this time-sensitive. Story notifications frequently arrived late or did not arrive at all, and even a working notification still required me to open every story and decide whether it contained an actual new-grad SWE opening.
+
+I built this system to replace that unreliable workflow with an always-on pipeline. It checks the public story feed throughout the day, recognizes which stories are genuine job drops, ignores unrelated content, and sends a high-priority phone notification that opens the original Instagram story. This creates a practical advantage during a competitive job search while turning a real frustration into an opportunity to learn how production systems fit together.
+
+## What It Does
+
+- Polls the target account every minute during waking hours and once per hour overnight.
+- Deduplicates story media before doing expensive work, so the same post is not classified or announced repeatedly.
+- Downloads images or extracts representative video frames with `ffmpeg`.
+- Uses Gemini multimodal classification to distinguish live new-grad SWE openings from memes, advice, promotions, senior roles, and other unrelated stories.
+- Sends immediate high-priority alerts during the day, applies company/urgency overrides overnight, and batches ordinary overnight results for the morning.
+- Runs continuously on Azure and recovers automatically from application crashes and VM reboots.
+
+## What I Learned and Applied
+
+| Area | How it appears in this project |
+| :--- | :--- |
+| API integration and scraping | Integrated a third-party Instagram downloader, adapted inconsistent external payloads, handled authentication, quotas, retries, rate limits, and expiring CDN URLs. |
+| Reliable state and concurrency | Used Upstash Redis, TTLs, atomic Lua scripts, batched claims, idempotency, deduplication, queues, and dead-letter handling. |
+| Applied AI | Built a strict multimodal Gemini classifier with structured JSON output, schema validation, deterministic prompting, quota pacing, and retry behavior. |
+| Media processing | Downloaded images and used `ffprobe`/`ffmpeg` to extract representative frames from video stories. |
+| Backend and system design | Designed a multi-stage ingest → claim → classify → escalate pipeline with quiet-hour behavior and explicit failure recovery. |
+| Cloud and Linux operations | Provisioned and operated an Ubuntu VM, networking, SSH controls, swap, process logs, resource monitoring, and reboot recovery in Azure. |
+| Containers and infrastructure as code | Packaged the worker with Docker and automated Azure resources with Terraform and cloud-init. |
+| Testing and observability | Added 64 automated tests, live smoke tests, structured logs, resource checks, Terraform drift detection, and crash/reboot verification. |
+
+## Live Deployment
+
+The production deployment was provisioned and verified on September 11, 2026:
+
+- Azure for Students `Standard_B2ats_v2` Ubuntu VM in Mexico Central.
 - Docker container `swe-alerts` with `unless-stopped` restart policy; Docker itself starts at boot.
 - Active polling every **60 seconds** from 08:00–23:00 ET and quiet polling every **3600 seconds** from 23:00–08:00 ET.
 - Upstash Redis remains externally hosted and supplies shared deduplication, processing claims, the quiet-hours queue, and the failed-classification queue.
