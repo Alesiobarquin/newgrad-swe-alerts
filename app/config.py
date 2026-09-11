@@ -13,7 +13,7 @@ _DEFAULT_OVERRIDE_COMPANIES = (
     "Google,Meta,Stripe,Jane Street,Citadel,OpenAI,Nvidia,Apple,Amazon,Microsoft,Netflix"
 )
 
-ScraperProvider = Literal["rapidapi", "apify_standby"]
+ScraperProvider = Literal["rapidapi", "instagram_downloader", "apify_standby"]
 NotifyProvider = Literal["ntfy", "pushover"]
 HttpMethod = Literal["GET", "POST"]
 
@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     upstash_redis_url: str = Field(min_length=1)
     gemini_api_key: str = Field(min_length=1)
     gemini_model: str = "gemini-3.6-flash"
+    gemini_min_request_interval_seconds: float = Field(default=13.0, ge=0)
 
     notify_provider: NotifyProvider = "ntfy"
     ntfy_base_url: str = "https://ntfy.sh"
@@ -110,9 +111,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _require_provider_secrets(self) -> Settings:
-        if self.scraper_provider == "rapidapi":
+        if self.scraper_provider in {"rapidapi", "instagram_downloader"}:
             if not self.rapidapi_key or not self.rapidapi_host:
-                raise ValueError("RAPIDAPI_KEY and RAPIDAPI_HOST are required when SCRAPER_PROVIDER=rapidapi")
+                raise ValueError(
+                    "RAPIDAPI_KEY and RAPIDAPI_HOST are required for RapidAPI scraper providers"
+                )
         elif self.scraper_provider == "apify_standby":
             if not self.apify_api_token or not self.apify_standby_url:
                 raise ValueError(

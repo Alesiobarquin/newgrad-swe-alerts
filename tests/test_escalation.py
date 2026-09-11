@@ -117,6 +117,24 @@ def test_dispatch_override_during_quiet_sends_p2(state) -> None:
     assert payload["sound"] == "siren"
 
 
+def test_dispatch_uses_story_fallback_when_job_link_missing(state) -> None:
+    settings = make_settings()
+    http = MagicMock()
+    http.post.return_value = MagicMock(status_code=200, json=lambda: {"status": 1})
+    http.post.return_value.raise_for_status = MagicMock()
+    escalator = Escalator(settings, http, state)
+
+    escalator.dispatch_positive(
+        story_id="fallback",
+        taken_at=None,
+        classification=_cls(job_link=None),
+        now=datetime(2026, 8, 26, 12, 0, tzinfo=TZ),
+        fallback_url="https://www.instagram.com/stories/zero2sudo/",
+    )
+
+    assert http.post.call_args.kwargs["data"]["url"] == "https://www.instagram.com/stories/zero2sudo/"
+
+
 def test_morning_burst_one_siren_then_p1_overflow(state) -> None:
     settings = make_settings()
     http = MagicMock()
@@ -174,4 +192,3 @@ def test_ntfy_emergency_uses_priority_5(state) -> None:
     assert body["title"].startswith("NEW GRAD SWE")
     assert "—" in body["title"]
     assert body["click"] == "https://jobs.example/1"
-

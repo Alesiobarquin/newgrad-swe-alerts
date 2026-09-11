@@ -1,4 +1,4 @@
-"""APScheduler entrypoint: dynamic 45s/300s polling and 08:00 ET morning burst."""
+"""APScheduler entrypoint with dynamic active/quiet polling and morning burst."""
 
 from __future__ import annotations
 

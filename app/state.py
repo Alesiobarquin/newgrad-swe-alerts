@@ -30,6 +30,22 @@ end
 return 0
 """
 
+_CLAIM_MANY_SCRIPT = """
+local claimed = {}
+for i = 2, #ARGV do
+  local key_index = i - 1
+  local seen_key = KEYS[(key_index * 2) - 1]
+  local claiming_key = KEYS[key_index * 2]
+  if redis.call('EXISTS', seen_key) == 0 then
+    local ok = redis.call('SET', claiming_key, '1', 'NX', 'EX', ARGV[1])
+    if ok then
+      table.insert(claimed, ARGV[i])
+    end
+  end
+end
+return claimed
+"""
+
 _PROMOTE_SCRIPT = """
 redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
 redis.call('DEL', KEYS[2])
@@ -55,11 +71,13 @@ class RedisState:
             health_check_interval=30,
         )
         self._claim_sha: str | None = None
+        self._claim_many_sha: str | None = None
         self._promote_sha: str | None = None
         self._drain_sha: str | None = None
         self._lua_enabled = False
         try:
             self._claim_sha = self._redis.script_load(_CLAIM_SCRIPT)
+            self._claim_many_sha = self._redis.script_load(_CLAIM_MANY_SCRIPT)
             self._promote_sha = self._redis.script_load(_PROMOTE_SCRIPT)
             self._drain_sha = self._redis.script_load(_DRAIN_SCRIPT)
             self._lua_enabled = True
@@ -91,6 +109,24 @@ class RedisState:
             except redis.RedisError:
                 self._disable_lua()
         return self._try_claim_native(story_id)
+
+    def try_claim_many(self, story_ids: Sequence[str]) -> set[str]:
+        unique_ids = list(dict.fromkeys(story_ids))
+        if not unique_ids:
+            return set()
+        if self._lua_enabled:
+            keys = [key for story_id in unique_ids for key in (_seen_key(story_id), _claiming_key(story_id))]
+            try:
+                result = self._eval(
+                    _CLAIM_MANY_SCRIPT,
+                    self._claim_many_sha,
+                    keys=keys,
+                    args=[str(self._settings.claim_ttl_seconds), *unique_ids],
+                )
+                return {str(story_id) for story_id in (result or [])}
+            except redis.RedisError:
+                self._disable_lua()
+        return {story_id for story_id in unique_ids if self._try_claim_native(story_id)}
 
     def mark_seen_and_release(self, story_id: str) -> None:
         if self._lua_enabled:

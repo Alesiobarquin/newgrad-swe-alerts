@@ -1,0 +1,26 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - git
+
+write_files:
+  - path: /etc/sysctl.d/99-newgrad-alerts.conf
+    permissions: "0644"
+    content: |
+      vm.swappiness=10
+
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker ${admin_username}
+  - install -d -o ${admin_username} -g ${admin_username} -m 0750 /opt/newgrad-swe-alerts
+  - fallocate -l 2G /swapfile
+  - chmod 0600 /swapfile
+  - mkswap /swapfile
+  - swapon /swapfile
+  - [sh, -c, "grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab"]
+  - sysctl --system
+
+final_message: "newgrad-swe-alerts host initialization complete"

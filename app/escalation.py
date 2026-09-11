@@ -181,10 +181,18 @@ class Escalator:
         self._state = state
         self._notifier = notifier or build_notifier(settings, http)
 
-    def dispatch_positive(self, *, story_id: str, taken_at: datetime | None, classification: Classification, now: datetime) -> None:
+    def dispatch_positive(
+        self,
+        *,
+        story_id: str,
+        taken_at: datetime | None,
+        classification: Classification,
+        now: datetime,
+        fallback_url: str | None = None,
+    ) -> None:
         override = is_override(classification, self._settings)
         quiet = in_quiet_hours(now, self._settings)
-        title, body, url = _format_drop(classification, story_id=story_id)
+        title, body, url = _format_drop(classification, story_id=story_id, fallback_url=fallback_url)
         if quiet and not override:
             item = QuietQueueItem(
                 story_id=story_id,
@@ -266,7 +274,12 @@ def pack_morning_burst(items: list[QuietQueueItem]) -> tuple[str, list[QuietQueu
     return body, overflow
 
 
-def _format_drop(classification: Classification, *, story_id: str) -> tuple[str, str, str | None]:
+def _format_drop(
+    classification: Classification,
+    *,
+    story_id: str,
+    fallback_url: str | None = None,
+) -> tuple[str, str, str | None]:
     company = classification.company or "Unknown company"
     title = f"NEW GRAD SWE — {company}"
     parts = [
@@ -276,7 +289,7 @@ def _format_drop(classification: Classification, *, story_id: str) -> tuple[str,
     if classification.reason:
         parts.append(classification.reason)
     parts.append(f"story {story_id}")
-    url = classification.job_link
+    url = classification.job_link or fallback_url
     return title, truncate_message("\n".join(parts)), url
 
 

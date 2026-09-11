@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from typing import Any
 
 from app.config import Settings
@@ -52,11 +54,14 @@ class GeminiClassifier:
             from google import genai
 
             self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._rate_lock = threading.Lock()
+        self._last_request_started: float | None = None
 
     def classify(self, asset: StoryAsset, image_bytes: bytes, mime_type: str) -> Classification:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
+                self._wait_for_rate_slot()
                 return self._generate(asset, image_bytes, mime_type)
             except ClassificationError as exc:
                 last_error = exc
@@ -69,6 +74,19 @@ class GeminiClassifier:
                     continue
                 raise ClassificationError(str(exc)) from exc
         raise ClassificationError(str(last_error) if last_error else "classification failed")
+
+    def _wait_for_rate_slot(self) -> None:
+        interval = self._settings.gemini_min_request_interval_seconds
+        if interval <= 0:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            if self._last_request_started is not None:
+                remaining = interval - (now - self._last_request_started)
+                if remaining > 0:
+                    logger.info("waiting %.1fs for Gemini quota pacing", remaining)
+                    time.sleep(remaining)
+            self._last_request_started = time.monotonic()
 
     def _generate(self, asset: StoryAsset, image_bytes: bytes, mime_type: str) -> Classification:
         from google.genai import types

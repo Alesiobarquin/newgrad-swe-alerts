@@ -16,6 +16,7 @@ def make_settings(**overrides: object) -> Settings:
         "rapidapi_host": "instagram.example.p.rapidapi.com",
         "upstash_redis_url": "rediss://default:fake@localhost:6379",
         "gemini_api_key": "test-gemini-key",
+        "gemini_min_request_interval_seconds": 0,
         "pushover_app_token": "test-pushover-app",
         "pushover_user_key": "test-pushover-user",
         "notify_provider": "pushover",

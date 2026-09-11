@@ -42,8 +42,10 @@ def run_poll_tick(ctx: AppContext, *, now: datetime | None = None) -> int:
     try:
         stories = ctx.scraper.fetch_stories(ctx.settings.target_ig_username)
         logger.info("fetched %s stories for @%s", len(stories), ctx.settings.target_ig_username)
+        claimed_ids = ctx.state.try_claim_many([story.story_id for story in stories])
         for story in stories:
-            process_story(ctx, story, now=now)
+            if story.story_id in claimed_ids:
+                process_story(ctx, story, now=now, already_claimed=True)
         return len(stories)
     except ScraperError:
         logger.exception("ingest failed; tick aborted without claiming stories")
@@ -58,8 +60,8 @@ def run_poll_tick(ctx: AppContext, *, now: datetime | None = None) -> int:
         ctx.state.release_job_lock("poller")
 
 
-def process_story(ctx: AppContext, story: StoryAsset, *, now: datetime) -> None:
-    if not ctx.state.try_claim(story.story_id):
+def process_story(ctx: AppContext, story: StoryAsset, *, now: datetime, already_claimed: bool = False) -> None:
+    if not already_claimed and not ctx.state.try_claim(story.story_id):
         logger.debug("skip story %s (seen or in-flight)", story.story_id)
         return
 
@@ -104,6 +106,7 @@ def process_story(ctx: AppContext, story: StoryAsset, *, now: datetime) -> None:
             taken_at=story.taken_at,
             classification=classification,
             now=now,
+            fallback_url=f"https://www.instagram.com/stories/{story.username}/",
         )
     except PushoverError as exc:
         if exc.sent_uncertain:

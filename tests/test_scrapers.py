@@ -8,6 +8,7 @@ import pytest
 
 from app.scrapers.apify_standby import ApifyStandbyScraper
 from app.scrapers.base import ScraperError, build_scraper
+from app.scrapers.instagram_downloader import InstagramDownloaderScraper, _synthetic_story_id
 from app.scrapers.rapidapi import RapidApiScraper
 from tests.conftest import make_settings
 
@@ -38,6 +39,58 @@ def test_factory_selects_apify() -> None:
     )
     scraper = build_scraper(settings, MagicMock())
     assert isinstance(scraper, ApifyStandbyScraper)
+
+
+def test_factory_selects_instagram_downloader() -> None:
+    settings = make_settings(scraper_provider="instagram_downloader")
+    scraper = build_scraper(settings, MagicMock())
+    assert isinstance(scraper, InstagramDownloaderScraper)
+
+
+def test_instagram_downloader_fetches_and_normalizes(monkeypatch) -> None:
+    settings = make_settings(
+        scraper_provider="instagram_downloader",
+        rapidapi_host="instagram-downloader.example.p.rapidapi.com",
+    )
+    client = MagicMock()
+    client.get.return_value = _Resp(
+        200,
+        {
+            "media": [
+                {
+                    "type": "image",
+                    "quality": "HD",
+                    "thumbnail": "https://cdn.example/path/photo.jpg?thumb=1",
+                    "url": "https://cdn.example/path/photo.jpg?expires=one",
+                },
+                {
+                    "type": "video",
+                    "quality": "HD",
+                    "thumbnail": "https://cdn.example/path/video-cover.jpg",
+                    "url": "https://cdn.example/path/video.mp4?expires=two",
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr("app.scrapers.instagram_downloader.time.sleep", lambda _s: None)
+
+    stories = InstagramDownloaderScraper(settings, client).fetch_stories("zero2sudo")
+
+    assert len(stories) == 2
+    assert stories[0].media_type == "image"
+    assert stories[0].image_url == "https://cdn.example/path/photo.jpg?expires=one"
+    assert stories[1].media_type == "video"
+    assert stories[1].video_url == "https://cdn.example/path/video.mp4?expires=two"
+    assert stories[1].image_url == "https://cdn.example/path/video-cover.jpg"
+    _args, kwargs = client.get.call_args
+    assert kwargs["params"]["url"] == "https://www.instagram.com/stories/zero2sudo/"
+    assert kwargs["headers"]["X-RapidAPI-Host"] == settings.rapidapi_host
+
+
+def test_instagram_downloader_id_ignores_cdn_signature_and_host() -> None:
+    first = "https://scontent-a.example/path/media_123.jpg?token=one"
+    second = "https://scontent-b.example/other/media_123.jpg?token=two"
+    assert _synthetic_story_id(first) == _synthetic_story_id(second)
 
 
 def test_rapidapi_fetches_and_normalizes(monkeypatch) -> None:
@@ -139,4 +192,3 @@ def test_rapidapi_resolves_user_id_then_fetches_stories(monkeypatch) -> None:
     assert "user_id=111222333" in second_url
     scraper.fetch_stories("zero2sudo")
     assert client.request.call_count == 3
-

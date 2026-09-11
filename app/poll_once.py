@@ -1,4 +1,4 @@
-"""Run a single ingest → classify → notify tick (one RapidAPI request)."""
+"""Run a single ingest → classify → notify tick."""
 
 from __future__ import annotations
 
@@ -32,7 +32,10 @@ def main() -> int:
         f"quiet={quiet} scheduled_interval={interval}s "
         f"user=@{settings.target_ig_username} provider={settings.scraper_provider}"
     )
-    print("This uses one RapidAPI stories request (plus a one-time user_id lookup if needed).")
+    if settings.scraper_provider == "rapidapi":
+        print("This uses one RapidAPI stories request (plus a one-time user_id lookup if needed).")
+    elif settings.scraper_provider == "instagram_downloader":
+        print("This uses one Instagram Downloader /convert request.")
 
     try:
         ctx = build_context(settings)

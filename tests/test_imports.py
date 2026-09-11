@@ -3,7 +3,7 @@ from __future__ import annotations
 
 def test_package_imports() -> None:
     from app import classifier, config, escalation, http, logging_setup, main, media, models, notify_test, poll_once, pipeline, state
-    from app.scrapers import apify_standby, base, normalize, rapidapi
+    from app.scrapers import apify_standby, base, instagram_downloader, normalize, rapidapi
 
     assert config.Settings
     assert models.Classification
@@ -20,3 +20,4 @@ def test_package_imports() -> None:
     assert notify_test.main
     assert poll_once.main
     assert apify_standby.ApifyStandbyScraper
+    assert instagram_downloader.InstagramDownloaderScraper

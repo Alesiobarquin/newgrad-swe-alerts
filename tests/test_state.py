@@ -18,6 +18,17 @@ def test_two_phase_claim_then_seen(state, redis_client) -> None:
     assert state.try_claim("s1") is False
 
 
+def test_batch_claim_skips_seen_and_in_flight(state, redis_client) -> None:
+    redis_client.set(f"{SEEN_PREFIX}old", "1", ex=60)
+    redis_client.set(f"{CLAIMING_PREFIX}busy", "1", ex=60)
+
+    claimed = state.try_claim_many(["old", "busy", "new-a", "new-b", "new-a"])
+
+    assert claimed == {"new-a", "new-b"}
+    assert redis_client.exists(f"{CLAIMING_PREFIX}new-a")
+    assert redis_client.exists(f"{CLAIMING_PREFIX}new-b")
+
+
 def test_release_claim_allows_retry(state, redis_client) -> None:
     assert state.try_claim("s2") is True
     state.release_claim("s2")

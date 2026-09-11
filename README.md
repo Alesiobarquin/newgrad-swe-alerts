@@ -1,6 +1,19 @@
 # New Grad SWE Alert Engine
 
-A production-grade, low-latency alerting service that monitors Instagram story job drops (targeting [@zero2sudo](https://www.instagram.com/zero2sudo/)), parses and classifies postings via **Google Gemini Multimodal Vision**, and dispatches instant high-priority mobile push notifications (**ntfy** or **Pushover**) before application windows close.
+A production-grade, low-latency alerting service that monitors Instagram story job drops (targeting [@zero2sudo](https://www.instagram.com/zero2sudo/)), classifies story media with **Google Gemini Multimodal Vision**, and dispatches high-priority mobile push notifications (**ntfy** or **Pushover**) before application windows close. The production worker runs continuously on an Azure VM and does not depend on a developer computer remaining online.
+
+## Production Status
+
+The current deployment was provisioned and verified on September 11, 2026:
+
+- Azure for Students `Standard_B2ats_v2` Ubuntu VM in Mexico Central. The subscription's enforced region policy does not permit the originally considered East US or North Central US regions.
+- Docker container `swe-alerts` with `unless-stopped` restart policy; Docker itself starts at boot.
+- Active polling every **60 seconds** from 08:00–23:00 ET and quiet polling every **3600 seconds** from 23:00–08:00 ET.
+- Upstash Redis remains externally hosted and supplies shared deduplication, processing claims, the quiet-hours queue, and the failed-classification queue.
+- Live verification covered RapidAPI ingestion, a real Gemini image classification, ntfy emergency and quiet probes, repeated scheduled polls, application-process crash recovery, and a complete Azure VM reboot.
+- Current infrastructure matches Terraform with no drift, and all **64 tests** pass.
+
+See the [Azure operations runbook](infra/azure/README.md) for deployment, logs, troubleshooting, costs, and teardown.
 
 ---
 
@@ -8,20 +21,20 @@ A production-grade, low-latency alerting service that monitors Instagram story j
 
 ```
                                     +-----------------------+
-                                    |    APScheduler        |
-                                    | Dynamic 45s / 300s    |
+                                    | Azure VM + Docker     |
+                                    | APScheduler 60s/3600s |
                                     +-----------+-----------+
                                                 |
                                                 v
 +------------------------+          +-----------+-----------+
 | Instagram Story Source | -------> |   Ingestion Layer     |
-| RapidAPI / Apify       |          | normalize_payload()   |
+| RapidAPI / Apify       |          | Adapter -> StoryAsset |
 +------------------------+          +-----------+-----------+
                                                 |
                                                 v
                                     +-----------+-----------+
                                     |  Upstash Redis State  |
-                                    |  Atomic 2-Phase Claim |
+                                    | Batch Claim + Dedup   |
                                     +-----------+-----------+
                                                 |
                                                 v
@@ -62,7 +75,8 @@ A production-grade, low-latency alerting service that monitors Instagram story j
 ## Core Features
 
 - **Multi-Provider Scraping & Resilient Ingestion**:
-  - **RapidAPI**: Primary adapter with automatic template formatting, exponential backoff with jitter on HTTP 429/5xx, and dynamic username-to-`user_id` resolution (`RAPIDAPI_USER_ID_URL_TEMPLATE`).
+  - **Instagram Downloader (RapidAPI, production)**: Calls `/convert?url=https://www.instagram.com/stories/{username}/` to discover public story media. It derives stable deduplication IDs from Instagram CDN filenames because the provider does not return native story IDs.
+  - **Generic RapidAPI**: Configurable adapter with URL/body template formatting, capped exponential backoff on HTTP 429/5xx, and dynamic username-to-`user_id` resolution (`RAPIDAPI_USER_ID_URL_TEMPLATE`).
   - **Apify Standby**: Standby adapter maintaining persistent worker connections to eliminate per-tick cold starts.
   - **Universal Normalization**: Decoupled normalizer ([`app/scrapers/normalize.py`](app/scrapers/normalize.py)) parsing Instagram private API schemas, RapidAPI wrappers, tray formats, link stickers, and image candidates into unified [`StoryAsset`](app/models.py) objects.
 
@@ -74,11 +88,13 @@ A production-grade, low-latency alerting service that monitors Instagram story j
 - **Strict Multimodal Classification ([`app/classifier.py`](app/classifier.py))**:
   - Leverages Google Gemini (`gemini-3.6-flash`) with strict JSON schema enforcement ([`CLASSIFICATION_JSON_SCHEMA`](app/models.py)) at `temperature: 0.0`.
   - Rigorous prompt filtering rejects memes, lifestyle posts, quant/math riddles, generic career advice, bootcamps, and senior/manager roles.
-  - Identifies company name, role title, direct application links (from link stickers or OCR), and evaluates urgency scores ($1 \dots 5$).
+  - Identifies company name and role title, reads visible application URLs when possible, and evaluates urgency scores ($1 \dots 5$). The production downloader does not expose link-sticker destinations, so alerts fall back to the target Instagram story URL when no direct URL is visible.
+  - Spaces Gemini calls by at least 13 seconds to respect the configured model quota when several unseen stories arrive in one poll.
   - Gracefully recovers from API rate limits and classifies configuration errors ([`ClassifierConfigError`](app/classifier.py)) so claims are freed rather than poisoned.
 
 - **Two-Phase Atomic Deduplication & State ([`app/state.py`](app/state.py))**:
   - Powered by Upstash Redis with atomic Lua scripts (and fallback native pipelines).
+  - Claims a poll's story IDs in one batched Redis Lua round trip, so only unseen stories download media or reach Gemini.
   - Phase 1: Claims a story using `SET story:claiming:<id> 1 NX EX 180` to prevent duplicate processing across concurrent workers.
   - Phase 2: Upon successful evaluation or alert dispatch, promotes the record to `SET story:seen:<id> 1 EX 172800` (48-hour TTL) and removes the claim key.
   - Transient failures (e.g. network drops during frame download) delete the claim key immediately to trigger instant re-processing on the next tick.
@@ -97,8 +113,9 @@ A production-grade, low-latency alerting service that monitors Instagram story j
 
 - **Dynamic Polling Scheduler ([`app/main.py`](app/main.py))**:
   - Powered by APScheduler `BlockingScheduler`.
-  - Polling interval dynamically throttles: **45 seconds** during active day hours, **300 seconds** during quiet overnight hours.
+  - Production polling dynamically throttles to **60 seconds** during active day hours and **3600 seconds** during quiet overnight hours.
   - Cron triggers at 23:00 and 08:00 ET automatically adjust poller cadence and trigger morning batch delivery.
+  - The scheduler lives inside the long-running Python process. It is not cron or GitHub Actions; Azure keeps the VM online, Docker keeps the container online, and APScheduler decides when each poll runs.
 
 ---
 
@@ -123,6 +140,7 @@ newgrad-swe-alerts/
 │   └── scrapers/
 │       ├── __init__.py
 │       ├── apify_standby.py  # Apify actor standby HTTP client
+│       ├── instagram_downloader.py # Low-cost RapidAPI downloader adapter
 │       ├── base.py           # Scraper protocol and provider factory
 │       ├── normalize.py      # Vendor-agnostic Instagram JSON payload normalizer
 │       └── rapidapi.py       # RapidAPI stories client with dynamic user_id lookup
@@ -138,6 +156,7 @@ newgrad-swe-alerts/
 │   ├── test_scheduler.py     # Job registration and dynamic rescheduling tests
 │   ├── test_scrapers.py      # RapidAPI and Apify adapter tests
 │   └── test_state.py         # Redis claim transitions, Lua scripts, DLQ tests
+├── infra/azure/              # Terraform, cloud-init, deploy helper, and Azure runbook
 ├── Dockerfile                # Minimal container image (python:3.12-slim + ffmpeg)
 ├── pytest.ini                # Pytest execution configuration
 ├── requirements.txt          # Production runtime dependencies
@@ -158,21 +177,23 @@ cp .env.example .env
 
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `SCRAPER_PROVIDER` | No | `rapidapi` | Ingestion engine: `rapidapi` or `apify_standby`. |
+| `SCRAPER_PROVIDER` | No | `rapidapi` | Ingestion engine: `instagram_downloader`, `rapidapi`, or `apify_standby`. |
 | `TARGET_IG_USERNAME` | No | `zero2sudo` | Target Instagram handle to poll (without `@`). |
 | `TARGET_IG_USER_ID` | No | `""` | Optional static Instagram numerical ID (bypasses lookup). |
-| `RAPIDAPI_KEY` | Yes* | `""` | RapidAPI application key (*required if `rapidapi`). |
-| `RAPIDAPI_HOST` | Yes* | `""` | RapidAPI host header (e.g. `instagram-scraper-api2.p.rapidapi.com`). |
-| `RAPIDAPI_METHOD` | No | `GET` | HTTP verb for stories endpoint (`GET` or `POST`). |
-| `RAPIDAPI_URL_TEMPLATE`| No | `https://{host}/stories?user_id={user_id}` | URL template supporting `{host}`, `{username}`, `{user_id}`. |
+| `RAPIDAPI_KEY` | Yes* | `""` | RapidAPI application key (*required for either RapidAPI provider). |
+| `RAPIDAPI_HOST` | Yes* | `""` | RapidAPI host header. For the downloader: `instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com`. |
+| `RAPIDAPI_METHOD` | No | `GET` | HTTP verb for the generic RapidAPI stories endpoint (`GET` or `POST`). Ignored by `instagram_downloader`. |
+| `RAPIDAPI_URL_TEMPLATE`| No | `https://{host}/user/stories?username={username}` | Generic adapter URL template supporting `{host}`, `{username}`, and `{user_id}`. Ignored by `instagram_downloader`. |
 | `RAPIDAPI_BODY_TEMPLATE`| No | `""` | Optional JSON body template for POST endpoints. |
-| `RAPIDAPI_ITEMS_PATH` | No | `""` | Dot-notation JSON path to story array (e.g. `data.stories`). |
+| `RAPIDAPI_ITEMS_PATH` | No | `data.stories` | Generic adapter dot-notation JSON path to the story array. |
 | `RAPIDAPI_USER_ID_URL_TEMPLATE` | No | `https://{host}/user_id_by_username?username={username}` | Endpoint template used to resolve username to numerical ID. |
 | `APIFY_API_TOKEN` | Yes* | `""` | Apify API token (*required if `apify_standby`). |
 | `APIFY_STANDBY_URL` | Yes* | `""` | Full URL for persistent Apify Standby actor. |
+| `APIFY_STANDBY_METHOD` | No | `POST` | HTTP verb used for the Apify Standby actor (`GET` or `POST`). |
 | `UPSTASH_REDIS_URL` | **Yes** | — | Upstash Redis connection string (`rediss://default:...@...upstash.io:6379`). Auto-cleans `redis-cli` paste strings. |
 | `GEMINI_API_KEY` | **Yes** | — | Google Gemini API key. |
 | `GEMINI_MODEL` | No | `gemini-3.6-flash` | Gemini multimodal vision model name. |
+| `GEMINI_MIN_REQUEST_INTERVAL_SECONDS` | No | `13` | Minimum spacing between Gemini calls; keeps free-tier traffic below five requests/minute. |
 | `NOTIFY_PROVIDER` | No | `ntfy` | Push notification service: `ntfy` or `pushover`. |
 | `NTFY_BASE_URL` | No | `https://ntfy.sh` | ntfy instance server base URL. |
 | `NTFY_TOPIC` | Yes* | `""` | Secret topic name for ntfy (*required if `ntfy`). |
@@ -183,8 +204,8 @@ cp .env.example .env
 | `QUIET_HOURS_START_HOUR`| No | `23` | Hour in 24h format when quiet mode begins (23 = 11 PM). |
 | `QUIET_HOURS_END_HOUR` | No | `8` | Hour in 24h format when quiet mode ends & morning burst fires (8 = 8 AM). |
 | `TIMEZONE` | No | `America/New_York`| Timezone for quiet hours and log timestamps. |
-| `ACTIVE_POLL_INTERVAL_SECONDS` | No | `45` | Polling frequency during active daytime hours. |
-| `QUIET_POLL_INTERVAL_SECONDS` | No | `300` | Polling frequency during quiet overnight hours. |
+| `ACTIVE_POLL_INTERVAL_SECONDS` | No | `45` | Code default for active hours; the production `.env` and sample use `60` for the Pro quota. |
+| `QUIET_POLL_INTERVAL_SECONDS` | No | `300` | Code default for quiet hours; the production `.env` and sample use `3600`. |
 | `CLAIM_TTL_SECONDS` | No | `180` | In-flight story processing lock timeout. |
 | `STORY_TTL_SECONDS` | No | `172800` | Processed story deduplication retention (48 hours). |
 | `LOG_LEVEL` | No | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
@@ -230,8 +251,9 @@ pip install -r requirements-dev.txt
    - Choose a unique, unguessable topic name (e.g. `swe-drops-x92f`) and subscribe to it in the app.
    - Set `NTFY_TOPIC=swe-drops-x92f` in your `.env`.
 4. **RapidAPI**:
-   - Subscribe to an Instagram story scraper on [RapidAPI](https://rapidapi.com/).
-   - Populate `RAPIDAPI_KEY`, `RAPIDAPI_HOST`, and matching endpoint templates in `.env`.
+   - Subscribe to **Instagram Downloader - Download Instagram Stories - Videos** on [RapidAPI](https://rapidapi.com/).
+   - For that production provider, set `SCRAPER_PROVIDER=instagram_downloader` and `RAPIDAPI_HOST=instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com`; its generic method, URL/body template, items-path, and user-ID fields are ignored.
+   - For the generic adapter, set `SCRAPER_PROVIDER=rapidapi` and populate the matching endpoint templates.
 
 ---
 
@@ -262,7 +284,7 @@ Expected output:
 
 ### Run Full Test Suite
 
-Execute the comprehensive 59-test suite with coverage over media handling, normalizers, mock Redis state transitions, and escalation:
+Execute the comprehensive 64-test suite with coverage over media handling, normalizers, mock Redis state transitions, and escalation:
 
 ```bash
 pytest -v
@@ -295,6 +317,10 @@ docker run -d \
   newgrad-swe-alerts
 ```
 
+### Azure VM
+
+The [`infra/azure`](infra/azure) Terraform configuration provisions the always-on Ubuntu worker in Mexico Central, with Docker, SSH restricted to your current public IP, and 2 GiB swap. It deliberately keeps `.env` credentials outside Terraform state. Future application updates are deployed with `./infra/azure/deploy.sh`; see the [Azure runbook](infra/azure/README.md) for all commands.
+
 ### Process Signals
 
 The daemon handles process termination gracefully:
@@ -304,12 +330,20 @@ The daemon handles process termination gracefully:
 
 ## RapidAPI Quota Budgeting
 
-Depending on your RapidAPI subscription tier, configure polling intervals to optimize quota usage:
+Depending on your RapidAPI subscription tier, configure polling intervals to stay within quota. Instagram Downloader Pro provides 3,200 requests/day and supports the deployed one-minute active cadence plus hourly quiet cadence:
 
-| Tier | Monthly Request Limit | Recommended `ACTIVE_POLL_INTERVAL_SECONDS` | Recommended `QUIET_POLL_INTERVAL_SECONDS` | Approx. Daily Ingestion Rate |
+```env
+ACTIVE_POLL_INTERVAL_SECONDS=60
+QUIET_POLL_INTERVAL_SECONDS=3600
+```
+
+This schedule uses approximately 909 ingestion requests/day: about 900 during the 15 active hours and 9 during the 9 quiet hours. The downloader response does not include native story timestamps, captions, IDs, or sticker URLs. The adapter derives IDs from stable CDN filenames, while Gemini classifies only unseen media. When the API does not provide a job link, the alert opens `https://www.instagram.com/stories/zero2sudo/` so the user can tap the original sticker in Instagram.
+
+| Provider tier | Request limit | Recommended `ACTIVE_POLL_INTERVAL_SECONDS` | Recommended `QUIET_POLL_INTERVAL_SECONDS` | Approx. Daily ingestion rate |
 | :--- | :--- | :--- | :--- | :--- |
-| **Pro / Dedicated** | $\ge 12,000$ / mo ($\sim 400$/day) | `45` seconds | `300` seconds | $\approx 1,200$ calls/day |
-| **Basic / Free** | $100$ / month | `7200` seconds (2 hrs) | `14400` seconds (4 hrs) | $\approx 10$ calls/day |
+| **Instagram Downloader Pro** | 3,200/day | `60` seconds | `3600` seconds | $\approx 909$ calls/day |
+| **Instagram Downloader Basic** | 45/month | Do not run the daemon | Use `app.poll_once` manually | At most $\approx 1$ call/day for testing |
+| **Generic provider** | Plan-specific | Calculate from the provider allowance | Calculate from the provider allowance | Plan-specific |
 
 > [!NOTE]
 > If using `rapidapi_user_id_url_template`, the account `user_id` lookup runs only once on process startup and is cached in memory for all subsequent story polls. If you know the target ID in advance, set `TARGET_IG_USER_ID` in `.env` to eliminate the lookup request entirely.
@@ -318,4 +352,4 @@ Depending on your RapidAPI subscription tier, configure polling intervals to opt
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+No `LICENSE` file is currently included in this repository.

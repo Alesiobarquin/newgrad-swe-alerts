@@ -23,6 +23,10 @@ def build_scraper(settings: Settings, http: httpx.Client) -> StoryScraper:
         from app.scrapers.apify_standby import ApifyStandbyScraper
 
         return ApifyStandbyScraper(settings, http)
+    if settings.scraper_provider == "instagram_downloader":
+        from app.scrapers.instagram_downloader import InstagramDownloaderScraper
+
+        return InstagramDownloaderScraper(settings, http)
     from app.scrapers.rapidapi import RapidApiScraper
 
     return RapidApiScraper(settings, http)

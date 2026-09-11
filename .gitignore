@@ -18,3 +18,15 @@ build/
 *.log
 tmp/
 .python-version
+
+# Terraform local state and per-machine inputs
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
